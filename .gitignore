@@ -1,0 +1,10 @@
+# Build / test outputs — never commit these.
+out/
+out2/
+output/
+*.out
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
