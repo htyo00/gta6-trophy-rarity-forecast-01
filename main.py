@@ -1,59 +1,105 @@
-"""Week-one rarity forecast for GTA VI trophies (make.fun gta6-trophy-rarity-forecast-01).
+#!/usr/bin/env python3
+"""GTA VI trophy rarity forecast, v2.
 
-Idea, in one paragraph: every trophy's earn rate is modelled on the logit
-scale as a roughly straight line in log-time since launch (19 Nov 2026
-00:00Z). A weighted least-squares slope is fitted per trophy from the reads
-that actually contain it, recent reads count more, and a read that follows a
-sharp jump in players_tracked counts less, because fresh players enter the
-tracked pool before they earn anything, so the rate dips for accounting
-reasons, not because players stopped earning. The fitted slope is shrunk
-toward a prior slope for the trophy's kind, and the level is pulled toward a
-prior adoption curve for that kind; the pull grows with the horizon, so a
-90-minute practice case stays close to the last read while a 4.5-day final
-case leans on what each kind of trophy can plausibly do in a week. Spreads
-are honest: they grow with the square root of the horizon plus how
-unidentified the slope is (a frozen history tells us almost nothing about
-the slope), so the 90% band is wide when it should be.
+Model: earners-vs-players dilution.  A trophy's earn rate is a ratio,
+rate = 100 * E / T, with E = players who earned it and T = players
+Exophase tracks.  The two sides move for different reasons -- players
+earn trophies over time, while Exophase tracks more and more players who
+have mostly earned nothing yet -- so fitting the rate directly is wrong:
+after a refresh the tracked count jumps and every rate DILUTES down,
+even though earners only grew.  v1 fitted the rate and predicted UP;
+v2 fits both sides separately and divides.
 
-Only the standard library is used. No network, no randomness, no wall-clock
-dependence: the same input bytes always produce the same output bytes.
+Design, step by step:
+
+1. DECOMPOSITION.  For every trophy and every read, E = rate * T / 100
+   (float) and T = players_tracked.  Work in logs: log(rate) = log(E) -
+   log(T).  Fit TWO lines against x = ln(1 + hours since launch), one
+   for log(E) and one for log(T), each by weighted least squares with
+   recency weights 0.8**age_hours (age = hours from the read to the
+   checkpoint).  Extrapolate both lines to the target and take
+   rate_target = 100 * E_target / T_target, clamped to 0.01..99.99.
+   Then cap the median per trophy KIND (see CAPS below).
+
+2. KIND CLASSIFICATION.  A trophy's kind is decided from its own data
+   (tier + name + description) by classify(), and the rules are written
+   out there in comments.  In short:
+     platinum   = tier platinum.
+     completion = attains 100% completion.
+     story_final = completes the final mission (exactly that, not a
+       side character's "final mission for X").
+     story1..4 = "Complete Chapter N." (N = 1..4, earliest to latest).
+     grind_hard = heavy repetition / collection (250 stunts, 100
+       locations, 100 vehicles, 50 challenges, 3 card sets, gold in
+       every shooting challenge, 20 races, every drone-race location,
+       every meditation spot, all garage properties, 8 stranger
+       strands, explore all of Leonida).
+     grind_mid = lighter repetition / collection (5 bank vaults, 10
+       vehicles, try each activity once, an arcade game, beat Cal,
+       $250k laundering, $100k spending, a unique-animal hunt, a side
+       character's final mission).
+     misc       = everything else; when in doubt, misc.  Named story
+       missions that are not numbered chapters ("Complete Breakfast
+       Run." etc.) go to misc because their place in the story order
+       cannot be told from the data.
+
+3. STALE / FROZEN DETECTION.  If every read in the history is IDENTICAL
+   (same rates and same tracked count), those values are one STALE
+   snapshot from Exophase's last refresh before the first read, not a
+   series of fresh measurements.  The fit is then anchored at the FIRST
+   read (when the snapshot was actually measured, ~launch), never at
+   the last read: the frozen reads after it add no information and must
+   not drag the anchor to "now".  When the history varies, the anchor
+   is the last read, as usual.
+
+4. PRIOR SLOPES (used when history is frozen / a slope is unidentified).
+   Earners grow SLOWLY in the launch window (new tracked players have
+   earned nothing yet): platinum 0.02, completion 0.02, grind_hard
+   0.04, grind_mid 0.075, story1 0.15, story2 0.12, story3 0.10,
+   story4 0.08, story_final 0.06, misc 0.10 (all in x = ln(1+hours)
+   units).  Tracked grows FAST at first and slows:
+   slope_T_prior(t) = 0.25 + 0.85 * exp(-t_hours / 36), with t_hours =
+   hours from launch to the checkpoint (about 1.00 at 4.5 h, 0.29 at
+   108 h).  Shrinkage: slope* = (info * slope_fit + 3 * prior) /
+   (info + 3), where info = distinct observed values - 1 (frozen ->
+   info 0 -> full prior).  Earners slope clamped to [-0.2, 2.0],
+   tracked slope to [0, 2.0].
+
+5. SPREAD (honest and wide enough).  sigma = 0.35 + 0.30 *
+   sqrt(horizon_days) + frozen_bonus + 0.20 * min(resid_E, 1) +
+   0.20 * min(resid_T, 1), clamped to [0.4, 2.4]; frozen_bonus is
+   0.30 when frozen, else 0.30 / (1 + info); resid_E / resid_T are the
+   standard deviations of the log(E) / log(T) fit residuals.
+   Quantiles come from logit(median) + z_tau * sigma with
+   z = (-1.645, -0.674, 0, 0.674, 1.645), mapped back to percent,
+   rounded to 4 decimals, forced monotone non-decreasing.
+
+6. EDGE CASES.  Rate 100% clamps to a 99.99 logit; rate 0.00% clamps
+   to 0.01; a trophy whose last rate is >= 99% stays pinned at 99.9
+   with a narrow band (sigma 0.08); reads with a null rate for a
+   trophy are skipped for that trophy; a trophy never observed at all
+   gets a prior-only forecast (median 0.5% capped by its kind cap)
+   with a wide band (sigma 1.5).
+
+Runs with no network, stdlib only.  Reads $MAKEFUN_INPUT_DIR (else
+/input/), writes $MAKEFUN_OUTPUT_DIR (else /output/), one *.out per
+*.in found, in name order.  Deterministic: no randomness anywhere.
 """
 
 import json
 import math
 import os
-from datetime import datetime, timezone
-from pathlib import Path
+import re
+from datetime import datetime, timedelta, timezone
 
-LAUNCH = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
+# Standard-normal quantiles for the five levels 0.05/0.25/0.5/0.75/0.95.
+Z_TAU = (-1.6448536269514722, -0.6744897501960817, 0.0,
+         0.6744897501960817, 1.6448536269514722)
 
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-
-ASKED_LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-
-# Per-kind prior: (ceiling %, time constant hours, prior slope in logit per
-# unit of log-time, extra spread, max pull toward the prior curve).
-# Ceilings are week-one plausibility caps, not lifetime rarities: chapter 1
-# is finishable in an evening, 100% Completion is not finishable in a week
-# by more than a rounding error of players, and the platinum needs all of it.
-KINDS = {
-    "platinum":    (0.25, 500.0, 0.05, 0.25, 0.92),
-    "completion":  (0.40, 500.0, 0.05, 0.25, 0.90),
-    "grind_hard": (2.0, 400.0, 0.25, 0.20, 0.60),
-    "grind_mid":  (8.0, 200.0, 0.45, 0.15, 0.55),
-    "story1":     (60.0, 30.0, 1.20, 0.10, 0.65),
-    "story2":     (50.0, 48.0, 1.05, 0.10, 0.65),
-    "story3":     (40.0, 72.0, 0.90, 0.10, 0.65),
-    "story4":     (32.0, 96.0, 0.80, 0.10, 0.65),
-    "story_final": (22.0, 144.0, 0.70, 0.12, 0.65),
-    "misc":       (25.0, 72.0, 0.70, 0.12, 0.50),
-}
-
-# Hard upper bound on the median, per kind (percent). A safety rail so a
-# noisy positive slope can never push the platinum, or 100% Completion,
-# anywhere near the frozen early rate of 0.63%.
-MEDIAN_CAP = {
+# Median caps per kind, in percent.  Rare trophies cannot plausibly be
+# common a week after launch; the caps stop the dilution division from
+# ever claiming they are.
+CAPS = {
     "platinum": 1.0,
     "completion": 1.5,
     "grind_hard": 6.0,
@@ -66,308 +112,321 @@ MEDIAN_CAP = {
     "misc": 50.0,
 }
 
-GRIND_HINTS = (
-    "50 challenges", "collectible card", "100 locations",
-    "8 mission strands", "5 bank vaults", "100 vehicles",
-    "20 different races", "meditate at every", "drone race at every",
+# Prior earners slope per kind (log E per unit of ln(1 + hours)).
+# Small in the launch window: fresh tracked players dilute first.
+EARN_PRIOR = {
+    "platinum": 0.02,
+    "completion": 0.02,
+    "grind_hard": 0.04,
+    "grind_mid": 0.075,
+    "story1": 0.15,
+    "story2": 0.12,
+    "story3": 0.10,
+    "story4": 0.08,
+    "story_final": 0.06,
+    "misc": 0.10,
+}
+
+# Phrases (lowercased name + description) marking heavy grind trophies.
+_GRIND_HARD = (
+    "250 stunts",
+    "100 locations",
+    "100 vehicles",
+    "50 challenges",
+    "collectible card sets",
+    "gold medal in all",
+    "20 different races",
+    "every location",
+    "every spot",
+    "all garage properties",
+    "explore all of",
+    "8 mission strands",
+    "meditate at every",
+)
+
+# Phrases marking lighter grind / side-content trophies.
+_GRIND_MID = (
+    "5 bank vaults",
+    "10 vehicles",
+    "try each type",
+    "arcade game",
+    "beat cal",
+    "earn $250,000",
+    "spend $100,000",
+    "hunt a unique animal",
+    "final mission for ",
 )
 
 
-def parse_moment(text):
-    """ISO-8601 timestamp -> aware datetime (accepts a trailing Z)."""
-    return datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+def classify(trophy):
+    """Kind of one trophy, from its own tier + name + description.
 
+    Order matters: platinum and completion first, then the story
+    spine (final mission, then numbered chapters), then grind by
+    size of the ask, then misc as the fallback for anything unclear.
+    Named story missions without a chapter number ("Complete Breakfast
+    Run.") fall through to misc -- their order in the story cannot be
+    told from the data, and guessing would mis-cap them.
+    """
+    tier = (trophy.get("tier") or "").lower()
+    name = trophy.get("name") or ""
+    desc = trophy.get("description") or ""
+    text = (name + " " + desc).lower()
+    desc_l = desc.lower()
 
-def hours_after_launch(moment):
-    """Hours since launch; pre-launch reads count as hour zero."""
-    return max(0.0, (moment - LAUNCH).total_seconds() / 3600.0)
-
-
-def log_clock(hours):
-    """Log-time coordinate: ln(1 + hours since launch)."""
-    return math.log1p(hours)
-
-
-def clamp_pct(value):
-    return min(99.99, max(0.01, value))
-
-
-def pct_to_logit(pct):
-    p = clamp_pct(pct)
-    return math.log(p / (100.0 - p))
-
-
-def logit_to_pct(value):
-    if value >= 0:
-        return 100.0 / (1.0 + math.exp(-value))
-    top = math.exp(value)
-    return 100.0 * top / (1.0 + top)
-
-
-def four_decimals(value):
-    """Round to 4 decimals, halves away from zero (up for positives)."""
-    stepped = math.floor(value * 10000.0 + 0.5) / 10000.0
-    return stepped
-
-
-# --- Standard normal quantile (Acklam's rational approximation). ---
-
-_NORM_A = (-3.969683028665376e01, 2.209460984245205e02,
-           -2.759285104469687e02, 1.383577518672690e02,
-           -3.066479806614716e01, 2.506628277459239e00)
-_NORM_B = (-5.447609879822406e01, 1.615858368580409e02,
-           -1.556989798598866e02, 6.680131188771972e01,
-           -1.328068155288572e01)
-_NORM_C = (-7.784894002430293e-03, -3.223964580411365e-01,
-           -2.400758277161838e00, -2.549732539343734e00,
-           4.374664141464968e00, 2.938163982698783e00)
-_NORM_D = (7.784695709041462e-03, 3.224671290700398e-01,
-           2.445134137142996e00, 3.754408661907416e00)
-
-
-def gauss_quantile(prob):
-    """Approximate inverse of the standard normal CDF at prob in (0, 1)."""
-    if prob <= 0.0 or prob >= 1.0:
-        raise ValueError("probability must lie strictly between 0 and 1")
-    split_low = 0.02425
-    split_high = 1.0 - split_low
-    if prob < split_low:
-        q = math.sqrt(-2.0 * math.log(prob))
-        top = (((((_NORM_C[0] * q + _NORM_C[1]) * q + _NORM_C[2]) * q
-                 + _NORM_C[3]) * q + _NORM_C[4]) * q + _NORM_C[5])
-        bottom = (((_NORM_D[0] * q + _NORM_D[1]) * q + _NORM_D[2]) * q
-                  + _NORM_D[3]) * q + 1.0
-        return top / bottom
-    if prob > split_high:
-        q = math.sqrt(-2.0 * math.log(1.0 - prob))
-        top = (((((_NORM_C[0] * q + _NORM_C[1]) * q + _NORM_C[2]) * q
-                 + _NORM_C[3]) * q + _NORM_C[4]) * q + _NORM_C[5])
-        bottom = ((((_NORM_D[0] * q + _NORM_D[1]) * q + _NORM_D[2]) * q
-                   + _NORM_D[3]) * q + 1.0)
-        return -top / bottom
-    q = prob - 0.5
-    r = q * q
-    top = (((((_NORM_A[0] * r + _NORM_A[1]) * r + _NORM_A[2]) * r
-             + _NORM_A[3]) * r + _NORM_A[4]) * r + _NORM_A[5]) * q
-    bottom = (((((_NORM_B[0] * r + _NORM_B[1]) * r + _NORM_B[2]) * r
-                + _NORM_B[3]) * r + _NORM_B[4]) * r + 1.0)
-    return top / bottom
-
-
-def kind_of(trophy):
-    """Classify a trophy from its tier, name and description."""
-    tier = str(trophy.get("tier", "")).lower()
-    text = (str(trophy.get("name", "")) + " " +
-            str(trophy.get("description", ""))).lower()
     if tier == "platinum":
         return "platinum"
-    if "100% completion" in text:
+    if "100% completion" in desc_l:
         return "completion"
-    if "250 stunts" in text or "shooting range" in text:
-        return "grind_hard"
-    if "chapter 1" in text:
-        return "story1"
-    if "chapter 2" in text:
-        return "story2"
-    if "chapter 3" in text:
-        return "story3"
-    if "chapter 4" in text:
-        return "story4"
-    if "final mission" in text:
+    # "Complete the final mission." only: a side character's
+    # "final mission for Andy/Kenton/..." is NOT the story finale.
+    if "final mission" in desc_l and " for " not in desc_l:
         return "story_final"
-    if any(hint in text for hint in GRIND_HINTS):
-        return "grind_mid"
-    if tier == "gold":
+    m = re.search(r"complete chapter (\d+)", desc_l)
+    if m:
+        chapter = int(m.group(1))
+        if chapter <= 1:
+            return "story1"
+        if chapter == 2:
+            return "story2"
+        if chapter == 3:
+            return "story3"
+        return "story4"
+    if any(p in text for p in _GRIND_HARD):
+        return "grind_hard"
+    if any(p in text for p in _GRIND_MID):
         return "grind_mid"
     return "misc"
 
 
-def prior_pct(kind, target_hours):
-    """Prior adoption curve: ceiling * (1 - exp(-hours / tau))."""
-    ceiling, tau, _slope, _extra, _pull = KINDS[kind]
-    if target_hours <= 0.0:
-        return 0.01
-    return max(0.01, ceiling * (1.0 - math.exp(-target_hours / tau)))
+def _parse_time(s):
+    """ISO-8601 UTC timestamp -> aware datetime."""
+    return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
 
 
-def tracked_jump(reads, index):
-    """True when this read's tracked count jumped >25% over the last read."""
-    if index <= 0:
-        return False
-    before = reads[index - 1].get("players_tracked")
-    now = reads[index].get("players_tracked")
-    if not before or not now:
-        return False
-    return now > 1.25 * before
+def _clamp_pct(x):
+    return min(99.99, max(0.01, float(x)))
 
 
-def fit_line(points):
-    """Weighted least squares y = level + slope * (x - x_last).
-
-    points: list of (x, y, weight). Returns (level, slope, resid_rms).
-    With one usable point the slope is zero and the level is that point.
-    """
-    if not points:
-        return None, 0.0, None
-    x_last = points[-1][0]
-    total_w = sum(w for _x, _y, w in points)
-    if total_w <= 0:
-        return points[-1][1], 0.0, None
-    mean_x = sum(w * (x - x_last) for x, _y, w in points) / total_w
-    mean_y = sum(w * y for _x, y, w in points) / total_w
-    num = sum(w * ((x - x_last) - mean_x) * (y - mean_y)
-              for x, y, w in points)
-    den = sum(w * ((x - x_last) - mean_x) ** 2 for x, _y, w in points)
-    slope = num / den if den > 1e-12 else 0.0
-    level = mean_y - slope * mean_x
-    resid = None
-    if len(points) >= 3 and den > 1e-12:
-        sq = sum(w * (y - (level + slope * (x - x_last))) ** 2
-                 for x, y, w in points)
-        resid = math.sqrt(sq / total_w)
-    return level, slope, resid
+def _logit_pct(x):
+    """logit of a percent, with 0% / 100% clamped first."""
+    p = _clamp_pct(x) / 100.0
+    return math.log(p / (1.0 - p))
 
 
-def forecast_trophy(trophy, reads, target_hours, horizon_days):
-    """One trophy's five quantiles."""
-    kind = kind_of(trophy)
-    _ceiling, _tau, prior_slope, extra_spread, max_pull = KINDS[kind]
-    idx = trophy["_pos"]
-
-    points = []
-    for j, read in enumerate(reads):
-        rates = read.get("rates") or []
-        if idx >= len(rates) or rates[idx] is None:
-            continue
-        rate = float(rates[idx])
-        try:
-            moment = parse_moment(read.get("at") or read.get("slot"))
-        except (TypeError, ValueError):
-            continue
-        weight = 0.8 ** (len(reads) - 1 - j)
-        if tracked_jump(reads, j):
-            prev_rates = reads[j - 1].get("rates") or []
-            prev = prev_rates[idx] if idx < len(prev_rates) else None
-            if prev is not None and rate < float(prev):
-                # A refresh dip: new players dilute the rate for accounting
-                # reasons only, and one such point would drag the fitted
-                # slope negative. Drop it from the fit entirely; the reads
-                # after it (no jump) still enter normally.
-                continue
-        points.append((log_clock(hours_after_launch(moment)),
-                       pct_to_logit(rate), weight))
-
-    # Distinct levels among the points actually kept: a dropped refresh dip
-    # must not count as "movement" that would dilute the prior slope.
-    distinct_rates = {round(y, 6) for _x, y, _w in points}
-
-    # A trophy everyone already has stays earned: pin it, tight band.
-    last_rate = None
-    if reads:
-        last_rates = reads[-1].get("rates") or []
-        if idx < len(last_rates) and last_rates[idx] is not None:
-            last_rate = float(last_rates[idx])
-    if last_rate is not None and last_rate >= 99.0:
-        centre = pct_to_logit(99.9)
-        sigma = 0.08
-        return [four_decimals(clamp_pct(logit_to_pct(centre + gauss_quantile(lv) * sigma)))
-                for lv in ASKED_LEVELS]
-
-    informative = max(0, len(distinct_rates) - 1)
-    level, slope, resid = fit_line(points)
-    x_last = points[-1][0] if points else log_clock(hours_after_launch(LAUNCH))
-    x_target = log_clock(target_hours)
-
-    # Anchor: if the last read is a refresh dip, average the fitted level
-    # with the previous read's logit so one dilution event cannot drag the
-    # forecast down on its own.
-    if points and len(points) >= 2 and tracked_jump(reads, len(reads) - 1):
-        prev_rates = reads[-2].get("rates") or []
-        prev = prev_rates[idx] if idx < len(prev_rates) else None
-        if prev is not None and last_rate is not None and last_rate < float(prev):
-            level = 0.5 * level + 0.5 * pct_to_logit(float(prev))
-
-    if level is None:
-        # Never observed: fall back to the prior curve alone, wide band.
-        centre = pct_to_logit(prior_pct(kind, target_hours))
-        sigma = 1.5
-        return quantiles_from(centre, sigma)
-
-    # Shrink the fitted slope toward the kind's prior slope. A frozen
-    # history (one distinct rate) carries no slope information at all, so
-    # the prior slope takes over completely; real movement earns weight.
-    shrink_k = 3.0
-    slope_star = (informative * slope + shrink_k * prior_slope) / (informative + shrink_k)
-    slope_star = min(2.0, max(-0.15, slope_star))
-    step = max(0.0, x_target - x_last)
-    centre = level + slope_star * step
-
-    # Pull the level toward the prior adoption curve. The pull grows with
-    # the horizon: negligible at 90 minutes, dominant over 4.5 days.
-    grow = 1.0 - math.exp(-horizon_days / 2.0)
-    pull = max_pull * grow
-    if last_rate is not None and last_rate > 50.0:
-        pull *= 0.3
-    prior_centre = pct_to_logit(prior_pct(kind, target_hours))
-    centre = (1.0 - pull) * centre + pull * prior_centre
-    centre = min(centre, pct_to_logit(MEDIAN_CAP[kind]))
-
-    # Spread: base + random-walk growth + slope ignorance + instability.
-    sigma = 0.30 + 0.35 * math.sqrt(horizon_days)
-    sigma += 0.55 / (1.0 + informative)
-    sigma += extra_spread
-    if resid is not None:
-        sigma += 0.30 * min(resid, 1.0)
-    if len(reads) >= 2 and tracked_jump(reads, len(reads) - 1):
-        sigma += 0.25
-    sigma = min(2.2, max(0.35, sigma))
-    return quantiles_from(centre, sigma)
+def _inv_logit_pct(logit):
+    """Percent from a logit value, clamped to 0.01..99.99."""
+    if logit >= 0.0:
+        p = 1.0 / (1.0 + math.exp(-logit))
+    else:
+        e = math.exp(logit)
+        p = e / (1.0 + e)
+    return min(99.99, max(0.01, 100.0 * p))
 
 
-def quantiles_from(centre, sigma, levels=None):
-    levels = levels if levels is not None else ASKED_LEVELS
+def _wls_line(xs, ys, ws):
+    """Weighted least squares y = a + b*x; None if slope unidentified."""
+    if len(xs) < 2:
+        return None
+    sw = sum(ws)
+    if sw <= 0.0:
+        return None
+    mx = sum(w * x for w, x in zip(ws, xs)) / sw
+    my = sum(w * y for w, y in zip(ws, ys)) / sw
+    den = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
+    if den <= 0.0:
+        return None
+    b = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys)) / den
+    return (my - b * mx, b)
+
+
+def _resid_std(xs, ys, line):
+    """Population std of the residuals of a fitted line (0 if no fit)."""
+    if line is None or len(xs) < 2:
+        return 0.0
+    a, b = line
+    res = [y - (a + b * x) for x, y in zip(xs, ys)]
+    mean = sum(res) / len(res)
+    return math.sqrt(sum((r - mean) ** 2 for r in res) / len(res))
+
+
+def _shrink(fit, prior, info):
+    """Shrink a fitted slope toward its prior; info 0 -> full prior."""
+    if fit is None:
+        return prior
+    return (info * fit + 3.0 * prior) / (info + 3.0)
+
+
+def _quantiles(median, sigma):
+    """Five quantiles around a median percent, monotone, 4 decimals."""
+    centre = _logit_pct(median)
     out = []
-    prev = None
-    for lv in levels:
-        value = four_decimals(clamp_pct(logit_to_pct(centre + gauss_quantile(lv) * sigma)))
-        if prev is not None and value < prev:
-            value = prev
-        out.append(value)
-        prev = value
+    for z in Z_TAU:
+        out.append(round(_inv_logit_pct(centre + z * sigma), 4))
+    for i in range(1, len(out)):
+        if out[i] < out[i - 1]:
+            out[i] = out[i - 1]
     return out
 
 
-def forecast_case(case):
-    trophies = case.get("trophies") or []
-    reads = case.get("history") or []
-    horizon = float(case.get("horizon_minutes") or 0)
-    horizon_days = max(0.0, horizon / 1440.0)
-    try:
-        target_hours = hours_after_launch(parse_moment(case["target"]))
-    except (KeyError, TypeError, ValueError):
-        last = reads[-1] if reads else None
-        base = parse_moment(last.get("at")) if last else LAUNCH
-        target_hours = hours_after_launch(base) + horizon / 60.0
-    rows = []
-    for pos, trophy in enumerate(trophies):
-        marked = dict(trophy)
-        marked["_pos"] = pos
+def forecast_trophy(trophy, idx, history, launch, checkpoint, target,
+                    horizon_days):
+    """Forecast one trophy: (median percent, sigma) -> five quantiles."""
+    kind = classify(trophy)
+    cap = CAPS[kind]
+
+    # Collect one observation per read: (x, logE | None, logT, weight,
+    # rate | None, tracked).  x = ln(1 + hours since launch); weight is
+    # recency 0.8**age_hours.  A null rate skips logE for that read only.
+    points = []
+    for read in history:
+        tracked = read.get("players_tracked")
+        if not tracked or tracked <= 0:
+            continue
+        rates = read.get("rates") or []
+        rate = rates[idx] if idx < len(rates) else None
+        when = _parse_time(read["at"])
+        hours = max(0.0, (when - launch).total_seconds() / 3600.0)
+        age = max(0.0, (checkpoint - when).total_seconds() / 3600.0)
+        log_e = None
+        if rate is not None:
+            earners = max(float(rate), 0.01) * float(tracked) / 100.0
+            log_e = math.log(max(earners, 1e-9))
+        points.append((math.log1p(hours), log_e, math.log(float(tracked)),
+                       0.8 ** age, rate, float(tracked)))
+
+    # Never observed: prior curve only, wide band.
+    observed = [p for p in points if p[1] is not None]
+    if not observed:
+        return _quantiles(min(0.5, cap), 1.5)
+
+    last_rate = observed[-1][4]
+    # A trophy (nearly) everyone tracked has earned stays pinned at the
+    # top with a narrow band instead of being diluted down with the rest.
+    if last_rate is not None and last_rate >= 99.0:
+        return _quantiles(99.9, 0.08)
+
+    # Frozen = every read identical (same rates, same tracked): one stale
+    # snapshot, not a series.  Anchor it at the FIRST read, when the
+    # snapshot was actually measured; varying history anchors at the
+    # LAST read.  info = distinct values - 1, so frozen -> info 0 and
+    # the prior slopes take over completely.
+    rates_seen = [p[4] for p in observed]
+    tracked_seen = [p[5] for p in points]
+    frozen = len(set(rates_seen)) <= 1 and len(set(tracked_seen)) <= 1
+    info_e = len({p[1] for p in observed}) - 1
+    info_t = len({p[2] for p in points}) - 1
+    if frozen:
+        info_e = 0
+        info_t = 0
+
+    if frozen:
+        anchor_e = observed[0]
+        anchor_t = points[0]
+    else:
+        anchor_e = observed[-1]
+        anchor_t = points[-1]
+
+    # Fit log(E) and log(T) against x by recency-weighted least squares.
+    ex = [p[0] for p in observed]
+    ey = [p[1] for p in observed]
+    ew = [p[3] for p in observed]
+    tx = [p[0] for p in points]
+    ty = [p[2] for p in points]
+    tw = [p[3] for p in points]
+    line_e = _wls_line(ex, ey, ew)
+    line_t = _wls_line(tx, ty, tw)
+    resid_e = _resid_std(ex, ey, line_e)
+    resid_t = _resid_std(tx, ty, line_t)
+
+    # Priors.  Tracked prior depends on how far past launch the
+    # checkpoint is: fast early, slowing down.
+    t_cp = max(0.0, (checkpoint - launch).total_seconds() / 3600.0)
+    prior_t = 0.25 + 0.85 * math.exp(-t_cp / 36.0)
+    prior_e = EARN_PRIOR[kind]
+    slope_e = _shrink(line_e[1] if line_e else None, prior_e, info_e)
+    slope_t = _shrink(line_t[1] if line_t else None, prior_t, info_t)
+    slope_e = min(2.0, max(-0.2, slope_e))
+    slope_t = min(2.0, max(0.0, slope_t))
+
+    # Extrapolate both sides from the anchor to the target, then divide.
+    x_target = math.log1p(max(0.0, (target - launch).total_seconds()
+                              / 3600.0))
+    log_e_t = anchor_e[1] + slope_e * (x_target - anchor_e[0])
+    log_t_t = anchor_t[2] + slope_t * (x_target - anchor_t[0])
+    gap = min(4.6, max(-9.21, log_e_t - log_t_t))
+    median = min(99.99, max(0.01, 100.0 * math.exp(gap)))
+    median = min(median, cap)
+
+    # Spread: base + horizon growth + frozen bonus + fit residuals.
+    if frozen:
+        frozen_bonus = 0.30
+    else:
+        frozen_bonus = 0.30 / (1.0 + info_e)
+    sigma = (0.35 + 0.30 * math.sqrt(max(0.0, horizon_days))
+             + frozen_bonus
+             + 0.20 * min(resid_e, 1.0) + 0.20 * min(resid_t, 1.0))
+    sigma = min(2.4, max(0.4, sigma))
+
+    return _quantiles(median, sigma)
+
+
+def _launch_time(case):
+    """Launch = release_date at 00:00 UTC; fallback: earliest read."""
+    game = case.get("game") or {}
+    rel = game.get("release_date")
+    if rel:
         try:
-            qs = forecast_trophy(marked, reads, target_hours, horizon_days)
-        except Exception:
-            kind = kind_of(marked)
-            qs = quantiles_from(pct_to_logit(prior_pct(kind, target_hours)), 1.5)
-        rows.append({"id": trophy["id"], "q": qs})
+            dt = datetime.fromisoformat(str(rel).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            pass
+    history = case.get("history") or []
+    if history:
+        return _parse_time(history[0]["at"])
+    return _parse_time(case["at"])
+
+
+def process_case(case):
+    """One case dict -> {"trophies": [{"id": n, "q": [...]}]}."""
+    launch = _launch_time(case)
+    checkpoint = _parse_time(case["at"])
+    horizon_min = float(case.get("horizon_minutes") or 0)
+    target_raw = case.get("target")
+    if target_raw:
+        target = _parse_time(target_raw)
+    else:
+        target = checkpoint + timedelta(minutes=horizon_min)
+    horizon_days = horizon_min / 1440.0
+
+    trophies = case.get("trophies") or []
+    history = case.get("history") or []
+    rows = []
+    for idx, trophy in enumerate(trophies):
+        q = forecast_trophy(trophy, idx, history, launch, checkpoint,
+                            target, horizon_days)
+        rows.append({"id": trophy["id"], "q": q})
     return {"trophies": rows}
 
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        result = forecast_case(case)
-        text = json.dumps(result, separators=(",", ":")) + "\n"
-        (OUTPUT_DIR / (path.stem + ".out")).write_text(text, encoding="utf-8")
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input/"
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output/"
+    os.makedirs(out_dir, exist_ok=True)
+    for name in sorted(os.listdir(in_dir)):
+        if not name.endswith(".in"):
+            continue
+        with open(os.path.join(in_dir, name), "r",
+                  encoding="utf-8") as fh:
+            case = json.load(fh)
+        result = process_case(case)
+        stem = case.get("id") or name[:-3]
+        with open(os.path.join(out_dir, stem + ".out"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(result, fh, separators=(",", ":"))
+            fh.write("\n")
 
 
 if __name__ == "__main__":
